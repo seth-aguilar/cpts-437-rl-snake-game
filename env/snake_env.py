@@ -37,6 +37,7 @@ class SnakeEnv:
         death_penalty=-10.0,
         render_mode=False,
         max_steps_without_food=200,
+        reward_shaping=True,  # Enable distance-based reward shaping
     ):
         # Grid & rendering
         self.grid_width, self.grid_height = grid_size
@@ -47,6 +48,7 @@ class SnakeEnv:
         self.step_penalty = step_penalty
         self.food_reward = food_reward
         self.death_penalty = death_penalty
+        self.reward_shaping = reward_shaping
 
         self.max_steps_without_food = max_steps_without_food
 
@@ -94,6 +96,10 @@ class SnakeEnv:
         if self.done:
             raise RuntimeError("call reset() before calling setp again() after game finishes")
         
+        # Store previous distance to food for reward shaping
+        old_head = self.snake[0]
+        old_dist = self._manhattan_distance(old_head, self.food_pos)
+        
         # update direction based on action
         self._update_direction(action)
 
@@ -133,6 +139,14 @@ class SnakeEnv:
                 # normal move; pop tail
                 self.snake.pop()
                 self.steps_since_last_food += 1
+                
+                # Reward shaping: small reward for getting closer to food
+                if self.reward_shaping:
+                    new_dist = self._manhattan_distance(new_head, self.food_pos)
+                    if new_dist < old_dist:
+                        reward += 0.1  # Moving closer to food
+                    elif new_dist > old_dist:
+                        reward -= 0.1  # Moving away from food
 
                 # force termination if stuck too long; half death penalty
                 if self.steps_since_last_food > self.max_steps_without_food:
@@ -145,6 +159,10 @@ class SnakeEnv:
         obs = self._get_observation()
 
         return obs, reward, self.done, info
+    
+    def _manhattan_distance(self, pos1, pos2):
+        '''Calculate Manhattan distance between two positions'''
+        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
     
     def render(self, fps=15):
         '''Render game current game state with pygame'''
@@ -267,71 +285,151 @@ class SnakeEnv:
         '''
         Return the current state as a feature vector.
 
-        Current simple representation:
-        [danger_straight, danger_right, danger_left,
-         dir_up, dir_down, dir_left, dir_right,
-         food_dx, food_dy]
+        Enhanced representation with:
+        - Immediate danger (1 cell)
+        - Look-ahead danger (2 cells)
+        - Direction encoding
+        - Food direction
+        - Body awareness (tail direction, body density)
         '''
         head_x, head_y = self.snake[0]
 
-        # Direction one-hot flags (keep these as numeric)
+        # Direction one-hot flags
         dir_up_flag = int(self.direction == Direction.UP)
         dir_down_flag = int(self.direction == Direction.DOWN)
         dir_left_flag = int(self.direction == Direction.LEFT)
         dir_right_flag = int(self.direction == Direction.RIGHT)
 
-        # Helper to check danger in a given absolute direction
-        def will_collide_if(direction: Direction):
-            x, y = head_x, head_y
-            if direction == Direction.RIGHT:
-                x += 1
-            elif direction == Direction.LEFT:
-                x -= 1
-            elif direction == Direction.UP:
-                y -= 1
-            elif direction == Direction.DOWN:
-                y += 1
-            return self._is_collision((x, y))
+        # Helper to check collision at position
+        def is_danger(x, y):
+            if x < 0 or x >= self.grid_width or y < 0 or y >= self.grid_height:
+                return 1
+            if (x, y) in self.snake:
+                return 1
+            return 0
+
+        # Get direction vectors
+        dir_vectors = {
+            Direction.UP: (0, -1),
+            Direction.DOWN: (0, 1),
+            Direction.LEFT: (-1, 0),
+            Direction.RIGHT: (1, 0),
+        }
 
         curr = self.direction
 
-        # Straight is just current direction
-        straight_dir = curr
-
-        # Left/right relative to current direction (use different variable names!)
+        # Relative directions
         if curr == Direction.UP:
-            left_dir = Direction.LEFT
-            right_dir = Direction.RIGHT
+            left_dir, right_dir = Direction.LEFT, Direction.RIGHT
         elif curr == Direction.DOWN:
-            left_dir = Direction.RIGHT
-            right_dir = Direction.LEFT
+            left_dir, right_dir = Direction.RIGHT, Direction.LEFT
         elif curr == Direction.LEFT:
-            left_dir = Direction.DOWN
-            right_dir = Direction.UP
-        else:  # curr == Direction.RIGHT
-            left_dir = Direction.UP
-            right_dir = Direction.DOWN
+            left_dir, right_dir = Direction.DOWN, Direction.UP
+        else:
+            left_dir, right_dir = Direction.UP, Direction.DOWN
 
-        danger_straight = int(will_collide_if(straight_dir))
-        danger_right = int(will_collide_if(right_dir))
-        danger_left = int(will_collide_if(left_dir))
+        # Immediate danger (1 cell ahead)
+        dx, dy = dir_vectors[curr]
+        danger_straight_1 = is_danger(head_x + dx, head_y + dy)
+        
+        dx, dy = dir_vectors[left_dir]
+        danger_left_1 = is_danger(head_x + dx, head_y + dy)
+        
+        dx, dy = dir_vectors[right_dir]
+        danger_right_1 = is_danger(head_x + dx, head_y + dy)
 
-        # Food relative position (normalized by grid size)
+        # Look-ahead danger (2 cells ahead)
+        dx, dy = dir_vectors[curr]
+        danger_straight_2 = is_danger(head_x + 2*dx, head_y + 2*dy)
+        
+        dx, dy = dir_vectors[left_dir]
+        danger_left_2 = is_danger(head_x + 2*dx, head_y + 2*dy)
+        
+        dx, dy = dir_vectors[right_dir]
+        danger_right_2 = is_danger(head_x + 2*dx, head_y + 2*dy)
+
+        # Diagonal danger (helps detect traps)
+        dx_s, dy_s = dir_vectors[curr]
+        dx_l, dy_l = dir_vectors[left_dir]
+        dx_r, dy_r = dir_vectors[right_dir]
+        
+        danger_diag_left = is_danger(head_x + dx_s + dx_l, head_y + dy_s + dy_l)
+        danger_diag_right = is_danger(head_x + dx_s + dx_r, head_y + dy_s + dy_r)
+
+        # Count open spaces in each direction (path freedom)
+        def count_open_spaces(start_x, start_y, dx, dy, max_dist=5):
+            count = 0
+            for i in range(1, max_dist + 1):
+                x, y = start_x + i * dx, start_y + i * dy
+                if is_danger(x, y):
+                    break
+                count += 1
+            return count / max_dist  # Normalize
+
+        space_straight = count_open_spaces(head_x, head_y, *dir_vectors[curr])
+        space_left = count_open_spaces(head_x, head_y, *dir_vectors[left_dir])
+        space_right = count_open_spaces(head_x, head_y, *dir_vectors[right_dir])
+
+        # Food relative position (normalized)
         fx, fy = self.food_pos
         food_dx = (fx - head_x) / max(1, self.grid_width - 1)
         food_dy = (fy - head_y) / max(1, self.grid_height - 1)
 
+        # Food direction relative to snake's heading
+        food_ahead = 0
+        food_left = 0
+        food_right = 0
+        
+        if curr == Direction.UP:
+            food_ahead = 1 if fy < head_y else 0
+            food_left = 1 if fx < head_x else 0
+            food_right = 1 if fx > head_x else 0
+        elif curr == Direction.DOWN:
+            food_ahead = 1 if fy > head_y else 0
+            food_left = 1 if fx > head_x else 0
+            food_right = 1 if fx < head_x else 0
+        elif curr == Direction.LEFT:
+            food_ahead = 1 if fx < head_x else 0
+            food_left = 1 if fy > head_y else 0
+            food_right = 1 if fy < head_y else 0
+        else:  # RIGHT
+            food_ahead = 1 if fx > head_x else 0
+            food_left = 1 if fy < head_y else 0
+            food_right = 1 if fy > head_y else 0
+
+        # Snake length ratio (how much of grid is filled)
+        length_ratio = len(self.snake) / (self.grid_width * self.grid_height)
+
         state = np.array(
             [
-                danger_straight,
-                danger_right,
-                danger_left,
+                # Immediate danger
+                danger_straight_1,
+                danger_left_1,
+                danger_right_1,
+                # Look-ahead danger
+                danger_straight_2,
+                danger_left_2,
+                danger_right_2,
+                # Diagonal danger (trap detection)
+                danger_diag_left,
+                danger_diag_right,
+                # Open space in each direction
+                space_straight,
+                space_left,
+                space_right,
+                # Direction
                 dir_up_flag,
                 dir_down_flag,
                 dir_left_flag,
                 dir_right_flag,
+                # Food info
                 food_dx,
                 food_dy,
+                food_ahead,
+                food_left,
+                food_right,
+                # Snake info
+                length_ratio,
             ],
             dtype=np.float32,
         )
